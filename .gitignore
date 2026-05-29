@@ -1,0 +1,7 @@
+# AI 配置文件
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
