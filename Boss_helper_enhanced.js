@@ -6,6 +6,8 @@
 // @author       小臣 (基于Yangshengzhou开源项目)
 // @match        https://www.zhipin.com/web/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @run-at       document-idle
 // @supportURL   https://github.com/DYxiaochen/AI-BossJob
 // @homepageURL  https://github.com/DYxiaochen/AI-BossJob
@@ -23,14 +25,6 @@
   "use strict";
 
   /**
-   * @typedef {Object} HRInteraction
-   * @property {string} hrKey - HR唯一标识
-   * @property {boolean} hasGreeted - 是否已打招呼
-   * @property {boolean} hasSentResume - 是否已发送简历
-   * @property {boolean} hasSentImageResume - 是否已发送图片简历
-   */
-
-  /**
    * @typedef {Object} JobInfo
    * @property {string} jobId - 职位ID
    * @property {string} title - 职位标题
@@ -38,27 +32,6 @@
    * @property {string} salary - 薪资范围
    * @property {string} location - 工作地点
    * @property {string} hrKey - HR标识
-   */
-
-  /**
-   * @typedef {Object} GreetingItem
-   * @property {string} id - 问候语ID
-   * @property {string} content - 问候语内容
-   */
-
-  /**
-   * @typedef {Object} ImageResume
-   * @property {string} id - 图片简历ID
-   * @property {string} name - 图片简历名称
-   * @property {string} data - Base64编码的图片数据
-   */
-
-  /**
-   * @typedef {Object} ErrorInfo
-   * @property {string} message - 错误消息
-   * @property {string} stack - 错误堆栈
-   * @property {string} context - 错误上下文
-   * @property {string} timestamp - 时间戳
    */
 
   const CONFIG = {
@@ -73,25 +46,153 @@
 
   };
 
-  const DEFAULT_AI_ROLE_PROMPT = `你是一个严格、保守的求职岗位匹配评估助手，只负责分析简历与岗位是否匹配，不负责代替求职者聊天回复。
+  const DEFAULT_AI_API_URL = "https://spark-api-open.xf-yun.com/v1/chat/completions";
+
+  const hasUserscriptStorage = () =>
+    typeof GM_getValue === "function" && typeof GM_setValue === "function";
+
+  const getStorageItem = (key) => {
+    try {
+      return localStorage.getItem(key);
+    } catch (error) {
+      console.warn(`读取本地配置失败: ${key}`, error);
+      return null;
+    }
+  };
+
+  const setStorageItem = (key, value) => {
+    try {
+      localStorage.setItem(key, value);
+      return true;
+    } catch (error) {
+      console.error(`保存本地配置失败: ${key}`, error);
+      return false;
+    }
+  };
+
+  const removeStorageItem = (key) => {
+    try {
+      localStorage.removeItem(key);
+    } catch (error) {
+      console.warn(`清理本地配置失败: ${key}`, error);
+    }
+  };
+
+  const getSecureConfigItem = (key, defaultValue = "") => {
+    if (hasUserscriptStorage()) {
+      try {
+        const storedValue = GM_getValue(key, null);
+        if (storedValue !== null && storedValue !== undefined && storedValue !== "") {
+          return String(storedValue);
+        }
+      } catch (error) {
+        console.warn(`读取安全配置失败: ${key}`, error);
+      }
+    }
+
+    const legacyValue = getStorageItem(key);
+    if (legacyValue !== null && legacyValue !== "") {
+      if (hasUserscriptStorage()) {
+        try {
+          GM_setValue(key, legacyValue);
+          if (key === "aiApiKey") removeStorageItem(key);
+        } catch (error) {
+          console.warn(`迁移安全配置失败: ${key}`, error);
+        }
+      }
+      return legacyValue;
+    }
+
+    return defaultValue;
+  };
+
+  const setSecureConfigItem = (key, value) => {
+    const textValue = String(value ?? "");
+    if (hasUserscriptStorage()) {
+      try {
+        GM_setValue(key, textValue);
+        if (key === "aiApiKey") {
+          removeStorageItem(key);
+        } else {
+          setStorageItem(key, textValue);
+        }
+        return true;
+      } catch (error) {
+        console.warn(`保存安全配置失败，回退到localStorage: ${key}`, error);
+      }
+    }
+
+    return setStorageItem(key, textValue);
+  };
+
+  const getAiConfig = () => ({
+    apiKey: getSecureConfigItem("aiApiKey", ""),
+    apiUrl: getSecureConfigItem("aiApiUrl", DEFAULT_AI_API_URL),
+    model: getSecureConfigItem("aiModel", "lite"),
+  });
+
+  const normalizeApiUrl = (value) => {
+    const rawValue = String(value || "").trim();
+    if (!rawValue) return "";
+
+    try {
+      const url = new URL(rawValue);
+      if (!["http:", "https:"].includes(url.protocol)) return "";
+      return url.href;
+    } catch (_) {
+      return "";
+    }
+  };
+
+  const isSiliconFlowEndpoint = (value) => {
+    try {
+      return new URL(value).hostname.endsWith("siliconflow.cn");
+    } catch (_) {
+      return false;
+    }
+  };
+
+  const parseJsonObjectFromText = (text) => {
+    const rawText = String(text || "").trim();
+    const unwrapped = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+
+    try {
+      return JSON.parse(unwrapped);
+    } catch (_) {
+      const jsonText = unwrapped.match(/\{[\s\S]*\}/)?.[0];
+      if (!jsonText) throw new Error("未找到可解析JSON");
+      return JSON.parse(jsonText);
+    }
+  };
+
+  const parseJsonSafely = (text, defaultValue = null) => {
+    try {
+      const rawText = String(text || "").trim();
+      return rawText ? JSON.parse(rawText) : defaultValue;
+    } catch (_) {
+      return defaultValue;
+    }
+  };
+
+  const DEFAULT_AI_ROLE_PROMPT = `你是一个稳健、偏求职机会增长导向的岗位匹配评估助手，只负责分析简历与岗位是否匹配，不负责代替求职者聊天回复。
 
 你的目标：
 基于用户提供的真实简历内容、AI简历分析结果、岗位标题、公司信息、薪资地点、岗位标签、职位描述和职位要求，判断该岗位是否值得投递。
 
 核心原则：
 1. 只基于输入内容判断，不编造候选人经历、技能、学历、项目或证书。
-2. 采用严格匹配标准：只有岗位方向、核心技能、工作内容与候选人简历主线高度一致时，才建议投递。
+2. 采用稳健但不过度苛刻的匹配标准：岗位方向与候选人简历主线相关，或核心技能/项目经历有明确可迁移性时，可以建议投递。
 3. 不要只因为岗位标题包含“后端”“Java”“开发”等字样就判断适合，必须结合职位描述和职位要求。
 4. 如果候选人主方向是 Java 后端应用开发，则优先匹配 Java/Spring/Spring Boot/业务系统/Web后端/接口开发/数据库/缓存/中间件/微服务等应用后端岗位。
 5. 如果岗位明显偏基础设施、基础软件、云原生底层、容器、虚拟化、DPU、编译器、分布式存储、网络、操作系统、AIOps、软硬件一体化、机器学习基础平台等方向，即使标题包含“后端”，也应倾向于不建议投递。
-6. 如果岗位要求的核心技能在简历中没有体现，或岗位职责明显偏离候选人主方向，应不建议投递。
-7. 如果信息不足，优先保守判断；不要为了提高投递量而放宽匹配标准。
+6. 如果岗位硬性要求的核心技能、学历/届别/身份或工作方向与简历明显冲突，才不建议投递；普通加分项缺失不应直接判为不投。
+7. 如果信息不足但岗位方向与简历主线相关，允许以中等置信度建议投递；只有明显不匹配、硬门槛不符或风险很高时才返回不建议投递。
 8. 输出必须遵循调用方要求的格式；当调用方要求 JSON 时，只返回可解析 JSON，不要返回 Markdown、解释文字或代码块。
-9. 判断理由要简洁、具体，指出匹配点或不匹配风险关键词。
+9. 置信度评分不要过低：可投递的弱匹配通常给 55-70 分，中等匹配给 70-85 分，高匹配给 85 分以上；不适合岗位才给 50 分以下。
 10. 必须关注岗位对毕业年份、毕业时间、应届届别、在校生身份、实习转正时间等要求；如果候选人的毕业年份或身份明显不符合，应倾向于不建议投递，并在理由中说明风险。`;
 
   const getAiRolePrompt = () => {
-    const savedRole = localStorage.getItem("aiRole") || "";
+    const savedRole = getStorageItem("aiRole") || "";
     const isChatPrompt = /面对HR|20字内|聊天回复|个性化回复|自我介绍/.test(savedRole);
     const isLegacyDefaultPrompt =
       /不要暴露你是\s*AI|不要生成聊天话术|不要生成自我介绍/.test(
@@ -104,7 +205,7 @@
 
   const getStoredJSON = (key, defaultValue) => {
     try {
-      const val = localStorage.getItem(key);
+      const val = getStorageItem(key);
       return val ? JSON.parse(val) : defaultValue;
     } catch (e) {
       console.error(`Error parsing ${key}:`, e);
@@ -112,10 +213,27 @@
     }
   };
 
+  const getStoredStringArray = (key, defaultValue = []) => {
+    const value = getStoredJSON(key, defaultValue);
+    return Array.isArray(value)
+      ? value.map((item) => String(item).trim()).filter(Boolean)
+      : defaultValue;
+  };
+
+  const getStoredBoolean = (key, defaultValue = false) => {
+    const value = getStoredJSON(key, defaultValue);
+    return typeof value === "boolean" ? value : defaultValue;
+  };
+
+  const getStoredString = (key, defaultValue = "") => {
+    const value = getStoredJSON(key, defaultValue);
+    return typeof value === "string" ? value : defaultValue;
+  };
+
   // 安全地存储大文本到localStorage（自动截断）
   const setLargeItem = (key, value, maxLength = 500000) => {
     try {
-      let textToStore = value;
+      let textToStore = String(value ?? "");
       
       // 如果文本太长，截断它
       if (textToStore && textToStore.length > maxLength) {
@@ -131,16 +249,15 @@
         textToStore = textToStore.substring(0, Math.floor(maxLength / 2)) + "\n[内容已大幅截断以符合存储限制]";
       }
       
-      localStorage.setItem(key, JSON.stringify(textToStore));
-      return true;
+      return setStorageItem(key, JSON.stringify(textToStore));
     } catch (e) {
-      if (e.name === 'QuotaExceededError' || e.message.includes('quota')) {
+      const message = String(e?.message || "");
+      if (e.name === 'QuotaExceededError' || message.includes('quota')) {
         console.error(`存储空间不足，无法保存${key}`);
         // 尝试保存截断版本
         try {
           const truncated = String(value).substring(0, 100000) + "\n[因存储限制已截断]";
-          localStorage.setItem(key, JSON.stringify(truncated));
-          return 'truncated';
+          return setStorageItem(key, JSON.stringify(truncated)) ? 'truncated' : false;
         } catch (e2) {
           console.error(`即使截断后仍无法保存${key}`);
           return false;
@@ -307,15 +424,19 @@
     return `实习薪资不高于[${max}]`;
   };
 
+  const initialAiConfig = getAiConfig();
+
   const state = {
     isRunning: false,
+    runId: 0,
+    currentAiRequest: null,
     currentIndex: 0,
     currentCityIndex: 0,
 
-    includeKeywords: getStoredJSON("includeKeywords", []),
-    locationKeywords: getStoredJSON("locationKeywords", []),
-    excludeTitleKeywords: getStoredJSON("excludeTitleKeywords", []),
-    excludeCompanyKeywords: getStoredJSON("excludeCompanyKeywords", []),
+    includeKeywords: getStoredStringArray("includeKeywords", []),
+    locationKeywords: getStoredStringArray("locationKeywords", []),
+    excludeTitleKeywords: getStoredStringArray("excludeTitleKeywords", []),
+    excludeCompanyKeywords: getStoredStringArray("excludeCompanyKeywords", []),
     internSalaryMin: parseSalaryBound(getStoredJSON("internSalaryMin", "")),
     internSalaryMax: parseSalaryBound(getStoredJSON("internSalaryMax", "")),
 
@@ -323,25 +444,24 @@
 
     ui: {
       isMinimized: false,
-      theme: localStorage.getItem("theme") || "light",
     },
 
     settings: {
       ai: {
         role: getAiRolePrompt(),
         // 免费版本：用户自定义AI API配置
-        apiKey: localStorage.getItem("aiApiKey") || "",
-        apiUrl: localStorage.getItem("aiApiUrl") || "https://spark-api-open.xf-yun.com/v1/chat/completions",
-        model: localStorage.getItem("aiModel") || "lite",
+        apiKey: initialAiConfig.apiKey,
+        apiUrl: initialAiConfig.apiUrl,
+        model: initialAiConfig.model,
       },
-      recruiterActivityStatus: getStoredJSON(
+      recruiterActivityStatus: getStoredStringArray(
         "recruiterActivityStatus",
         ["不限"]
       ),
-      excludeHeadhunters: getStoredJSON("excludeHeadhunters", false),
-      useAiJobScreening: getStoredJSON("useAiJobScreening", false),
-      resumeText: getStoredJSON("resumeText", ""),
-      resumeAnalysis: getStoredJSON("resumeAnalysis", ""),
+      excludeHeadhunters: getStoredBoolean("excludeHeadhunters", false),
+      useAiJobScreening: getStoredBoolean("useAiJobScreening", false),
+      resumeText: getStoredString("resumeText", ""),
+      resumeAnalysis: getStoredString("resumeAnalysis", ""),
     },
   };
 
@@ -542,12 +662,6 @@
       this._applyTheme();
       this.createControlPanel();
       this.createMiniIcon();
-
-      this.setupJobCardClickListener();
-    },
-
-    setupJobCardClickListener() {
-      // 评论功能已移除
     },
 
     createControlPanel() {
@@ -695,7 +809,7 @@
       const closeBtn = this._createIconButton(
         "✕",
         () => {
-          state.isMinimized = true;
+          state.ui.isMinimized = true;
           elements.panel.style.transform = "translateY(160%)";
           elements.miniIcon.style.display = "flex";
         },
@@ -908,40 +1022,6 @@
         `;
 
       controlCol.append(label, input);
-      return controlCol;
-    },
-
-    _createSelectControl(labelText, id, options) {
-      const controlCol = document.createElement("div");
-      controlCol.style.cssText = "flex: 1;";
-
-      const label = document.createElement("label");
-      label.textContent = labelText;
-      label.style.cssText =
-        "display:block; margin-bottom:5px; font-weight: 500; color: #333; font-size: 0.9rem;";
-
-      const select = document.createElement("select");
-      select.id = id;
-      select.style.cssText = `
-            width: 100%;
-            padding: 8px 10px;
-            border-radius: 8px;
-            border: 1px solid #d1d5db;
-            font-size: 14px;
-            background: white;
-            color: #333;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
-            transition: all 0.2s ease;
-        `;
-
-      options.forEach((option) => {
-        const opt = document.createElement("option");
-        opt.value = option.value;
-        opt.textContent = option.text;
-        select.appendChild(opt);
-      });
-
-      controlCol.append(label, select);
       return controlCol;
     },
 
@@ -1190,7 +1270,9 @@
     },
 
     createMiniIcon() {
+      document.getElementById("boss-mini-icon")?.remove();
       elements.miniIcon = document.createElement("div");
+      elements.miniIcon.id = "boss-mini-icon";
       elements.miniIcon.style.cssText = `
         width: ${CONFIG.MINI_ICON_SIZE || 48}px;
         height: ${CONFIG.MINI_ICON_SIZE || 48}px;
@@ -1231,7 +1313,7 @@
       });
 
       elements.miniIcon.addEventListener("click", () => {
-        state.isMinimized = false;
+        state.ui.isMinimized = false;
         elements.panel.style.transform = "translateY(0)";
         elements.miniIcon.style.display = "none";
       });
@@ -1255,39 +1337,39 @@
       role: getAiRolePrompt(),
     },
 
-    recruiterActivityStatus: JSON.parse(
-      localStorage.getItem("recruiterActivityStatus") || '["不限"]'
-    ),
+    recruiterActivityStatus: getStoredStringArray("recruiterActivityStatus", ["不限"]),
 
-    excludeHeadhunters: JSON.parse(
-      localStorage.getItem("excludeHeadhunters") || "false"
-    ),
+    excludeHeadhunters: getStoredBoolean("excludeHeadhunters", false),
 
-    useAiJobScreening: JSON.parse(
-      localStorage.getItem("useAiJobScreening") || "false"
-    ),
+    useAiJobScreening: getStoredBoolean("useAiJobScreening", false),
   };
 
   function saveSettings() {
-    localStorage.setItem("aiRole", settings.ai.role);
+    setStorageItem("aiRole", settings.ai.role);
 
-    localStorage.setItem(
+    setStorageItem(
       "recruiterActivityStatus",
       JSON.stringify(settings.recruiterActivityStatus)
     );
 
-    localStorage.setItem(
+    setStorageItem(
       "excludeHeadhunters",
       settings.excludeHeadhunters.toString()
     );
 
-    localStorage.setItem(
+    setStorageItem(
       "useAiJobScreening",
       settings.useAiJobScreening.toString()
     );
 
     if (state.settings) {
-      Object.assign(state.settings, settings);
+      state.settings.ai = {
+        ...state.settings.ai,
+        ...settings.ai,
+      };
+      state.settings.recruiterActivityStatus = settings.recruiterActivityStatus;
+      state.settings.excludeHeadhunters = settings.excludeHeadhunters;
+      state.settings.useAiJobScreening = settings.useAiJobScreening;
     }
   }
 
@@ -2498,9 +2580,10 @@
     const apiUrlInput = body.querySelector("#ai-api-url");
     const modelInput = body.querySelector("#ai-model");
     const statusDiv = body.querySelector("#ai-config-status");
-    apiKeyInput.value = localStorage.getItem("aiApiKey") || "";
-    apiUrlInput.value = localStorage.getItem("aiApiUrl") || "";
-    modelInput.value = localStorage.getItem("aiModel") || "";
+    const savedAiConfig = getAiConfig();
+    apiKeyInput.value = savedAiConfig.apiKey;
+    apiUrlInput.value = savedAiConfig.apiUrl;
+    modelInput.value = savedAiConfig.model;
 
     body.querySelectorAll(".ai-preset-btn").forEach((btn) => {
       btn.style.cssText = "padding:8px 12px;border:1px solid #d1d5db;border-radius:8px;background:#f8fafc;cursor:pointer;";
@@ -2520,9 +2603,15 @@
         statusDiv.style.color = "#dc2626";
         return;
       }
+      const normalizedApiUrl = normalizeApiUrl(apiUrl);
+      if (!normalizedApiUrl) {
+        statusDiv.textContent = "API URL 必须是有效的 HTTP(S) 地址";
+        statusDiv.style.color = "#dc2626";
+        return;
+      }
 
       statusDiv.textContent = "正在测试 API 连接...";
-      const result = await testAiConnection(apiKey, apiUrl, model);
+      const result = await testAiConnection(apiKey, normalizedApiUrl, model);
       statusDiv.textContent = result.success ? `连接成功：${result.message}` : `连接失败：${result.message}`;
       statusDiv.style.color = result.success ? "#16a34a" : "#dc2626";
     });
@@ -2531,12 +2620,20 @@
       const apiKey = apiKeyInput.value.trim();
       const apiUrl = apiUrlInput.value.trim();
       const model = modelInput.value.trim();
-      if (apiKey) localStorage.setItem("aiApiKey", apiKey);
-      if (apiUrl) localStorage.setItem("aiApiUrl", apiUrl);
-      if (model) localStorage.setItem("aiModel", model);
-      state.settings.ai.apiKey = apiKey;
-      state.settings.ai.apiUrl = apiUrl;
-      state.settings.ai.model = model;
+      const normalizedApiUrl = normalizeApiUrl(apiUrl);
+      if (apiUrl && !normalizedApiUrl) {
+        statusDiv.textContent = "API URL 必须是有效的 HTTP(S) 地址";
+        statusDiv.style.color = "#dc2626";
+        return;
+      }
+
+      if (apiKey) setSecureConfigItem("aiApiKey", apiKey);
+      if (normalizedApiUrl) setSecureConfigItem("aiApiUrl", normalizedApiUrl);
+      if (model) setSecureConfigItem("aiModel", model);
+      state.settings.ai = {
+        ...state.settings.ai,
+        ...getAiConfig(),
+      };
       statusDiv.textContent = "配置已保存";
       statusDiv.style.color = "#16a34a";
       setTimeout(() => (dialog.style.display = "none"), 700);
@@ -2547,9 +2644,19 @@
 
   function testAiConnection(apiKey, apiUrl, model) {
     return new Promise((resolve) => {
+      const normalizedApiUrl = normalizeApiUrl(apiUrl);
+      if (!normalizedApiUrl) {
+        resolve({ success: false, message: "API URL 无效" });
+        return;
+      }
+      if (typeof GM_xmlhttpRequest !== "function") {
+        resolve({ success: false, message: "当前脚本管理器不支持跨域请求" });
+        return;
+      }
+
       GM_xmlhttpRequest({
         method: "POST",
-        url: apiUrl,
+        url: normalizedApiUrl,
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiKey}`,
@@ -2562,9 +2669,14 @@
         timeout: CONFIG.API.TIMEOUT,
         onload: (response) => {
           try {
-            const result = JSON.parse(response.responseText);
+            const result = parseJsonSafely(response.responseText);
             if (response.status < 200 || response.status >= 300) {
-              resolve({ success: false, message: result.error?.message || `HTTP ${response.status}` });
+              const fallbackMessage = String(response.responseText || "").trim().slice(0, 160);
+              resolve({ success: false, message: result?.error?.message || fallbackMessage || `HTTP ${response.status}` });
+              return;
+            }
+            if (!result) {
+              resolve({ success: false, message: "AI响应不是有效JSON" });
               return;
             }
             const message =
@@ -2583,30 +2695,38 @@
   }
 
   const Core = {
-    async startProcessing() {
+    isActive(runId) {
+      return state.isRunning && state.runId === runId;
+    },
+
+    async startProcessing(runId) {
       if (!location.pathname.includes("/jobs")) {
         this.log("瘦身版仅保留职位页海投流程，请打开职位页面使用");
-        state.isRunning = false;
+        stopProcessing();
         return;
       }
 
-      await this.autoScrollJobList();
-      while (state.isRunning) {
-        await this.processJobList();
+      await this.autoScrollJobList(runId);
+      if (!this.isActive(runId)) return;
+
+      while (this.isActive(runId)) {
+        await this.processJobList(runId);
+        if (!this.isActive(runId)) break;
         await this.delay(CONFIG.BASIC_INTERVAL);
       }
     },
 
-    async autoScrollJobList() {
+    async autoScrollJobList(runId) {
       const maxHistory = 3;
       const cardCountHistory = [];
 
-      for (let i = 0; i < 8 && state.isRunning; i++) {
+      for (let i = 0; i < 8 && this.isActive(runId); i++) {
         window.scrollTo({
           top: document.documentElement.scrollHeight,
           behavior: "smooth",
         });
         await this.delay(CONFIG.BASIC_INTERVAL);
+        if (!this.isActive(runId)) return;
         cardCountHistory.push(getJobCardsFromPage().length);
         if (cardCountHistory.length > maxHistory) cardCountHistory.shift();
         if (
@@ -2622,9 +2742,9 @@
       await this.delay(500);
     },
 
-    async scrollToLoadMoreJobs() {
+    async scrollToLoadMoreJobs(runId) {
       const viewportHeight = window.innerHeight;
-      for (let i = 0; i < 3; i++) {
+      for (let i = 0; i < 3 && this.isActive(runId); i++) {
         const currentScroll = window.scrollY || document.documentElement.scrollTop;
         window.scrollTo({
           top: currentScroll + viewportHeight * 0.8,
@@ -2633,16 +2753,19 @@
         this.log(`正在加载更多职位... (${i + 1}/3)`);
         await this.delay(1000);
       }
+      if (!this.isActive(runId)) return;
       window.scrollTo({ top: 0, behavior: "smooth" });
       await this.delay(500);
     },
 
-    async processJobList() {
+    async processJobList(runId) {
+      if (!this.isActive(runId)) return;
       const activeStatusFilter = settings.recruiterActivityStatus;
 
       if (!state.jobList || state.jobList.length === 0) {
         const excludeHeadhunters = settings.excludeHeadhunters;
-        await this.scrollToLoadMoreJobs();
+        await this.scrollToLoadMoreJobs(runId);
+        if (!this.isActive(runId)) return;
 
         const allJobCards = getJobCardsFromPage();
         const filterFailures = [];
@@ -2664,7 +2787,7 @@
 
         if (!allJobCards.length) {
           this.log("没有识别到职位卡片：可能是页面列表还没加载完成，或BOSS页面结构变化导致选择器失效");
-          toggleProcess();
+          stopProcessing();
           return;
         }
 
@@ -2688,7 +2811,7 @@
           if (filterFailures.length > 12) {
             this.log(`还有 ${filterFailures.length - 12} 个职位被排除，以上仅展示前 12 个`);
           }
-          toggleProcess();
+          stopProcessing();
           return;
         }
 
@@ -2696,7 +2819,7 @@
       }
 
       if (state.currentIndex >= state.jobList.length) {
-        await this.resetCycle();
+        await this.resetCycle(runId);
         return;
       }
 
@@ -2704,6 +2827,7 @@
       currentCard.scrollIntoView({ behavior: "smooth", block: "center" });
       currentCard.click();
       await this.delay(CONFIG.OPERATION_INTERVAL * 2);
+      if (!this.isActive(runId)) return;
 
       let activeTime = "未知";
       const onlineTag = document.querySelector(".boss-online-tag");
@@ -2728,6 +2852,7 @@
       if (settings.useAiJobScreening) {
         this.log(`AI正在判断岗位：${jobNumber}/${state.jobList.length} ${jobInfo.title || ""}`);
         const aiDecision = await this.evaluateJobWithAI({ ...jobInfo, activeTime });
+        if (!this.isActive(runId)) return;
 
         if (aiDecision.fallback) {
           this.log(`AI判断不可用，按硬规则继续：${aiDecision.reason}`);
@@ -2763,15 +2888,17 @@
       );
       state.currentIndex++;
 
+      if (!this.isActive(runId)) return;
       const chatBtn = document.querySelector("a.op-btn-chat");
       if (chatBtn && chatBtn.textContent.trim() === "立即沟通") {
         chatBtn.click();
-        await this.handleGreetingModal();
+        await this.handleGreetingModal(runId);
       }
     },
 
-    async handleGreetingModal() {
+    async handleGreetingModal(runId) {
       await this.delay(CONFIG.OPERATION_INTERVAL * 3);
+      if (!this.isActive(runId)) return;
       const stayBtn = [...document.querySelectorAll(".default-btn.cancel-btn")].find(
         (button) => button.textContent.trim() === "留在此页"
       );
@@ -2842,12 +2969,7 @@
     },
 
     parseAiJobScreeningResponse(responseText) {
-      const rawText = String(responseText || "").trim();
-      const unwrapped = rawText.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
-      const jsonText = unwrapped.match(/\{[\s\S]*\}/)?.[0];
-      if (!jsonText) throw new Error("AI未返回JSON");
-
-      const parsed = JSON.parse(jsonText);
+      const parsed = parseJsonObjectFromText(responseText);
       const normalizeList = (value) => {
         if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
         if (typeof value === "string") {
@@ -2856,9 +2978,12 @@
         return [];
       };
 
+      const shouldApply = parsed.shouldApply === true || parsed.shouldApply === "true";
+      const rawConfidence = Number(parsed.confidence) || 0;
+
       return {
-        shouldApply: parsed.shouldApply === true || parsed.shouldApply === "true",
-        confidence: Number(parsed.confidence) || 0,
+        shouldApply,
+        confidence: shouldApply ? Math.max(55, Math.min(rawConfidence, 100)) : rawConfidence,
         reason: String(parsed.reason || "").trim() || "AI未提供原因",
         riskKeywords: normalizeList(parsed.riskKeywords),
         matchedSkills: normalizeList(parsed.matchedSkills),
@@ -2866,9 +2991,7 @@
     },
 
     async evaluateJobWithAI(jobInfo) {
-      const apiKey = localStorage.getItem("aiApiKey");
-      const apiUrl = localStorage.getItem("aiApiUrl");
-      const model = localStorage.getItem("aiModel");
+      const { apiKey, apiUrl, model } = getAiConfig();
       const resumeText = state.settings.resumeText || "";
       const resumeAnalysis = state.settings.resumeAnalysis || "";
       const fallbackDecision = (reason) => ({
@@ -2885,7 +3008,7 @@
         return fallbackDecision("未找到简历内容或简历分析");
       }
 
-      const screeningPrompt = `你是严格的求职岗位匹配审核助手。请判断候选人是否应该投递这个岗位。
+      const screeningPrompt = `你是稳健、偏求职机会增长导向的岗位匹配审核助手。请判断候选人是否应该投递这个岗位。
 
 请只返回JSON，不要输出Markdown、解释或多余文字。
 
@@ -2906,9 +3029,11 @@ ${resumeAnalysis || "无"}
 ${this.truncateForAi(jobInfo.description, 5000) || "无"}
 
 判断标准：
-1. 采用严格匹配，只推荐投递与候选人主方向和核心技能高度一致的岗位。
-2. 如果岗位明显偏基础设施、云原生底层、容器、虚拟化、DPU、编译器、分布式存储、网络、AIOps、基础软件、操作系统内核、硬件一体化等方向，应返回 shouldApply=false。
-3. 必须关注岗位对毕业年份、毕业时间、应届届别、在校生身份、实习转正时间等要求；如果候选人的毕业年份或身份明显不符合，应返回 shouldApply=false。
+1. 采用稳健但不过度苛刻的匹配标准。只要岗位方向与候选人主线相关，或核心技能/项目经历有明确可迁移性，即使不是完全贴合，也可以返回 shouldApply=true。
+2. 置信度低一点也可以投递：弱匹配但值得尝试时返回 shouldApply=true，confidence 给 55-70；中等匹配给 70-85；高度匹配给 85 以上。
+3. 只有岗位明显偏基础设施、云原生底层、容器、虚拟化、DPU、编译器、分布式存储、网络、AIOps、基础软件、操作系统内核、硬件一体化等候选人主线明显不相关方向，才返回 shouldApply=false。
+4. 普通加分项缺失、经验年限略偏高、职位描述较泛时，不要直接判为不投；可以降低 confidence，但仍建议投递。
+5. 必须关注岗位对毕业年份、毕业时间、应届届别、在校生身份、实习转正时间等硬性要求；如果候选人的毕业年份或身份明显不符合，应返回 shouldApply=false。
 
 返回JSON格式：
 {
@@ -2933,16 +3058,22 @@ ${this.truncateForAi(jobInfo.description, 5000) || "无"}
     },
 
     async requestAi(message, options = {}) {
-      const apiKey = localStorage.getItem("aiApiKey");
-      const apiUrl = localStorage.getItem("aiApiUrl");
-      const model = localStorage.getItem("aiModel");
+      const { apiKey, apiUrl, model } = getAiConfig();
       if (!apiKey || !apiUrl || !model) {
         this.log("未配置AI API，请先点击AI配置按钮设置API Key");
         throw new Error("未配置AI API");
       }
+      const normalizedApiUrl = normalizeApiUrl(apiUrl);
+      if (!normalizedApiUrl) {
+        this.log("AI API URL无效，请重新配置");
+        throw new Error("AI API URL无效");
+      }
+      if (typeof GM_xmlhttpRequest !== "function") {
+        throw new Error("当前脚本管理器不支持跨域请求");
+      }
 
       const messages = [{ role: "user", content: message }];
-      if (!apiUrl.includes("siliconflow.cn")) {
+      if (!isSiliconFlowEndpoint(normalizedApiUrl)) {
         messages.unshift({
           role: "system",
           content: options.systemRole || getAiRolePrompt(),
@@ -2958,9 +3089,22 @@ ${this.truncateForAi(jobInfo.description, 5000) || "无"}
       if (options.topP !== undefined) requestBody.top_p = options.topP;
 
       return new Promise((resolve, reject) => {
-        GM_xmlhttpRequest({
+        let request = null;
+        const clearCurrentRequest = () => {
+          if (state.currentAiRequest === request) state.currentAiRequest = null;
+        };
+        const resolveOnce = (value) => {
+          clearCurrentRequest();
+          resolve(value);
+        };
+        const rejectOnce = (error) => {
+          clearCurrentRequest();
+          reject(error);
+        };
+
+        request = GM_xmlhttpRequest({
           method: "POST",
-          url: apiUrl,
+          url: normalizedApiUrl,
           headers: {
             "Content-Type": "application/json",
             Authorization: `Bearer ${apiKey}`,
@@ -2969,9 +3113,14 @@ ${this.truncateForAi(jobInfo.description, 5000) || "无"}
           timeout: 30000,
           onload: (response) => {
             try {
-              const result = JSON.parse(response.responseText);
+              const result = parseJsonSafely(response.responseText);
               if (response.status < 200 || response.status >= 300) {
-                reject(new Error(result.error?.message || `HTTP ${response.status}`));
+                const fallbackMessage = String(response.responseText || "").trim().slice(0, 160);
+                rejectOnce(new Error(result?.error?.message || fallbackMessage || `HTTP ${response.status}`));
+                return;
+              }
+              if (!result) {
+                rejectOnce(new Error("AI响应不是有效JSON"));
                 return;
               }
               const content =
@@ -2979,17 +3128,19 @@ ${this.truncateForAi(jobInfo.description, 5000) || "无"}
                 result.choices?.[0]?.text ||
                 result.data?.choices?.[0]?.message?.content;
               if (!content) {
-                reject(new Error("AI响应格式异常"));
+                rejectOnce(new Error("AI响应格式异常"));
                 return;
               }
-              resolve(content);
+              resolveOnce(content);
             } catch (error) {
-              reject(error);
+              rejectOnce(error);
             }
           },
-          onerror: () => reject(new Error("网络请求失败")),
-          ontimeout: () => reject(new Error("请求超时")),
+          onerror: () => rejectOnce(new Error("网络请求失败")),
+          ontimeout: () => rejectOnce(new Error("请求超时")),
+          onabort: () => rejectOnce(new Error("请求已停止")),
         });
+        state.currentAiRequest = request;
       });
     },
 
@@ -3066,13 +3217,14 @@ ${this.truncateForAi(jobInfo.description, 5000) || "无"}
       return `${cleaned.slice(0, maxLength)}\n[内容已截断]`;
     },
 
-    async resetCycle() {
+    async resetCycle(runId) {
       const cities = state.locationKeywords.filter((kw) => kw.trim() !== "");
       if (cities.length > 1 && state.currentCityIndex < cities.length - 1) {
         state.currentCityIndex++;
         const nextCity = cities[state.currentCityIndex];
         this.log(`切换到下一个城市: ${nextCity}`);
         await this.switchCity(nextCity);
+        if (!this.isActive(runId)) return;
         state.jobList = [];
         state.currentIndex = 0;
         await this.delay(2500);
@@ -3080,7 +3232,7 @@ ${this.truncateForAi(jobInfo.description, 5000) || "无"}
       }
 
       this.log("本轮职位处理完成");
-      toggleProcess();
+      stopProcessing();
     },
 
     async switchCity(cityName) {
@@ -3166,63 +3318,85 @@ ${this.truncateForAi(jobInfo.description, 5000) || "无"}
     },
   };
 
-  async function toggleProcess() {
-    state.isRunning = !state.isRunning;
+  function stopProcessing() {
+    state.isRunning = false;
+    state.runId++;
+    state.currentIndex = 0;
 
-    if (state.isRunning) {
-      state.jobList = [];
-      state.currentIndex = 0;
-      state.currentCityIndex = 0;
-
-      state.includeKeywords = parseKeywordList(elements.includeInput?.value || "");
-      state.locationKeywords = parseKeywordList(elements.locationInput?.value || "");
-      state.excludeTitleKeywords = parseKeywordList(elements.excludeTitleInput?.value || "");
-      state.excludeCompanyKeywords = parseKeywordList(elements.excludeCompanyInput?.value || "");
-      state.internSalaryMin = parseSalaryBound(elements.internSalaryMinInput?.value);
-      state.internSalaryMax = parseSalaryBound(elements.internSalaryMaxInput?.value);
-
-      if (
-        state.internSalaryMin !== null &&
-        state.internSalaryMax !== null &&
-        state.internSalaryMin > state.internSalaryMax
-      ) {
-        const originalMin = state.internSalaryMin;
-        state.internSalaryMin = state.internSalaryMax;
-        state.internSalaryMax = originalMin;
+    if (state.currentAiRequest?.abort) {
+      try {
+        state.currentAiRequest.abort();
+      } catch (error) {
+        console.warn("停止AI请求失败:", error);
       }
-
-      localStorage.setItem("includeKeywords", JSON.stringify(state.includeKeywords));
-      localStorage.setItem("locationKeywords", JSON.stringify(state.locationKeywords));
-      localStorage.setItem("excludeTitleKeywords", JSON.stringify(state.excludeTitleKeywords));
-      localStorage.setItem("excludeCompanyKeywords", JSON.stringify(state.excludeCompanyKeywords));
-      localStorage.setItem("internSalaryMin", JSON.stringify(state.internSalaryMin));
-      localStorage.setItem("internSalaryMax", JSON.stringify(state.internSalaryMax));
-
-      elements.controlBtn.textContent = "停止海投";
-      const logPanel = document.querySelector("#pro-log");
-      if (logPanel) logPanel.innerHTML = "";
-
-      Core.log(`开始自动海投，时间：${new Date().toLocaleTimeString()}`);
-      Core.log(
-        `筛选条件：职位名包含【${state.includeKeywords.join("、") || "无"}】，职位名排除【${state.excludeTitleKeywords.join("、") || "无"}】，工作地包含【${state.locationKeywords.join("、") || "无"}】，排除公司【${state.excludeCompanyKeywords.join("、") || "无"}】，${getInternSalaryFilterLabel()}`
-      );
-      Core.log(
-        `筛选开关：AI判断${settings.useAiJobScreening ? "开启" : "关闭"}，排除猎头${settings.excludeHeadhunters ? "开启" : "关闭"}，招聘者活跃状态【${settings.recruiterActivityStatus.join("、") || "不限"}】`
-      );
-
-      const firstCity = state.locationKeywords.find((kw) => kw.trim() !== "");
-      if (firstCity) {
-        Core.log(`准备切换到第一个城市: ${firstCity}`);
-        await Core.switchCity(firstCity);
-        await Core.delay(2000);
-      }
-
-      Core.startProcessing();
-    } else {
-      elements.controlBtn.textContent = "启动海投";
-      state.isRunning = false;
-      state.currentIndex = 0;
     }
+    state.currentAiRequest = null;
+
+    if (elements.controlBtn) {
+      elements.controlBtn.textContent = "启动海投";
+    }
+  }
+
+  async function toggleProcess() {
+    if (state.isRunning) {
+      stopProcessing();
+      Core.log("已停止海投");
+      return;
+    }
+
+    state.isRunning = true;
+    const runId = ++state.runId;
+
+    state.jobList = [];
+    state.currentIndex = 0;
+    state.currentCityIndex = 0;
+
+    state.includeKeywords = parseKeywordList(elements.includeInput?.value || "");
+    state.locationKeywords = parseKeywordList(elements.locationInput?.value || "");
+    state.excludeTitleKeywords = parseKeywordList(elements.excludeTitleInput?.value || "");
+    state.excludeCompanyKeywords = parseKeywordList(elements.excludeCompanyInput?.value || "");
+    state.internSalaryMin = parseSalaryBound(elements.internSalaryMinInput?.value);
+    state.internSalaryMax = parseSalaryBound(elements.internSalaryMaxInput?.value);
+
+    if (
+      state.internSalaryMin !== null &&
+      state.internSalaryMax !== null &&
+      state.internSalaryMin > state.internSalaryMax
+    ) {
+      const originalMin = state.internSalaryMin;
+      state.internSalaryMin = state.internSalaryMax;
+      state.internSalaryMax = originalMin;
+    }
+
+    setStorageItem("includeKeywords", JSON.stringify(state.includeKeywords));
+    setStorageItem("locationKeywords", JSON.stringify(state.locationKeywords));
+    setStorageItem("excludeTitleKeywords", JSON.stringify(state.excludeTitleKeywords));
+    setStorageItem("excludeCompanyKeywords", JSON.stringify(state.excludeCompanyKeywords));
+    setStorageItem("internSalaryMin", JSON.stringify(state.internSalaryMin));
+    setStorageItem("internSalaryMax", JSON.stringify(state.internSalaryMax));
+
+    elements.controlBtn.textContent = "停止海投";
+    const logPanel = document.querySelector("#pro-log");
+    if (logPanel) logPanel.replaceChildren();
+
+    Core.log(`开始自动海投，时间：${new Date().toLocaleTimeString()}`);
+    Core.log(
+      `筛选条件：职位名包含【${state.includeKeywords.join("、") || "无"}】，职位名排除【${state.excludeTitleKeywords.join("、") || "无"}】，工作地包含【${state.locationKeywords.join("、") || "无"}】，排除公司【${state.excludeCompanyKeywords.join("、") || "无"}】，${getInternSalaryFilterLabel()}`
+    );
+    Core.log(
+      `筛选开关：AI判断${settings.useAiJobScreening ? "开启" : "关闭"}，排除猎头${settings.excludeHeadhunters ? "开启" : "关闭"}，招聘者活跃状态【${settings.recruiterActivityStatus.join("、") || "不限"}】`
+    );
+
+    const firstCity = state.locationKeywords.find((kw) => kw.trim() !== "");
+    if (firstCity) {
+      Core.log(`准备切换到第一个城市: ${firstCity}`);
+      await Core.switchCity(firstCity);
+      if (!Core.isActive(runId)) return;
+      await Core.delay(2000);
+      if (!Core.isActive(runId)) return;
+    }
+
+    Core.startProcessing(runId);
   }
 
   function loadSettingsIntoUI() {
